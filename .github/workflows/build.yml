@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: unzip -o attendance-android.zip
+      - run: sed -i 's/<View/<FrameLayout/' attendance-android/app/src/main/res/layout/widget.xml
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
