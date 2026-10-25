@@ -1,29 +1,149 @@
+
 name: Build APK
+
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: unzip -o attendance-android.zip
-      - run: sed -i 's/<View/<FrameLayout/' attendance-android/app/src/main/res/layout/widget.xml
-      - run: mkdir -p ~/.android && cp debug.keystore ~/.android/debug.keystore
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Identify ZIP and remove duplicate app backups
+        id: appzip
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import os, re, zipfile, subprocess
+          from pathlib import Path
+
+          zips = sorted(Path(".").glob("*.zip"))
+
+          def app_id(path):
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      for name in z.namelist():
+                          if name.endswith(("build.gradle", "build.gradle.kts")):
+                              text = z.read(name).decode("utf-8", "ignore")
+                              m = re.search(
+                                  r'applicationId\s*(?:=\s*)?["\']([^"\']+)',
+                                  text
+                              )
+                              if m:
+                                  return m.group(1)
+              except Exception:
+                  pass
+              return None
+
+          changed = []
+          before = os.environ.get("BEFORE", "")
+          if before and set(before) != {"0"}:
+              r = subprocess.run(
+                  ["git", "diff", "--name-only", before,
+                   os.environ["SHA"], "--", "*.zip"],
+                  capture_output=True, text=True
+              )
+              changed = [
+                  Path(x) for x in r.stdout.splitlines()
+                  if Path(x).is_file() and Path(x).suffix.lower() == ".zip"
+              ]
+
+          candidates = changed or zips
+          identified = [(p, app_id(p)) for p in candidates]
+          identified = [(p, aid) for p, aid in identified if aid]
+
+          if not identified:
+              raise SystemExit(
+                  "No identifiable Android app ZIP found. Nothing deleted."
+              )
+
+          selected, selected_id = identified[-1]
+          print(f"Building {selected} (applicationId: {selected_id})")
+
+          for old in zips:
+              if old != selected and app_id(old) == selected_id:
+                  old.unlink()
+                  print(f"Removed duplicate backup: {old}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"zip={selected}\n")
+          PY
+
+      - name: Extract Android project
+        run: |
+          unzip -o "${{ steps.appzip.outputs.zip }}" -d extracted
+
+      - name: Locate project
+        id: project
+        run: |
+          PROJECT=$(find extracted -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)
+          if [ -z "$PROJECT" ]; then
+            echo "Gradle project not found in ZIP."
+            exit 1
+          fi
+          echo "dir=$(dirname "$PROJECT")" >> "$GITHUB_OUTPUT"
+
+      - name: Apply existing widget fix
+        run: |
+          WIDGET="${{ steps.project.outputs.dir }}/app/src/main/res/layout/widget.xml"
+          if [ -f "$WIDGET" ]; then
+            sed -i 's/<View/<FrameLayout/g; s#</View>#</FrameLayout>#g' "$WIDGET"
+          fi
+
+      - name: Set up Android SDK
+        run: |
+          mkdir -p ~/.android
+          if [ -f debug.keystore ]; then
+            cp debug.keystore ~/.android/debug.keystore
+          fi
+          yes | sdkmanager --licenses > /dev/null || true
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - run: yes | sdkmanager --licenses > /dev/null || true
+          java-version: "17"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
-      - run: gradle assembleDebug --no-daemon
-        working-directory: attendance-android
-      - run: cp attendance-android/app/build/outputs/apk/debug/app-debug.apk attendance.apk
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+        working-directory: ${{ steps.project.outputs.dir }}
+
+      - name: Copy APK
+        run: |
+          APK=$(find "${{ steps.project.outputs.dir }}" -path '*/build/outputs/apk/debug/*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "APK not found after build."
+            exit 1
+          fi
+          cp "$APK" attendance.apk
+
+      - name: Save ZIP cleanup
+        run: |
+          if ! git diff --quiet -- '*.zip'; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -u -- '*.zip'
+            git commit -m "Remove duplicate app ZIP backups"
+            git push
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.${{ github.run_number }}
